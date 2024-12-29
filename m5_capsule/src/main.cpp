@@ -1,143 +1,132 @@
+#include "Recorder.hpp"
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <FastLED.h>
 #include <M5Unified.h>
-#include <M5UnitLCD.h>
-#include <M5UnitOLED.h>
 
-static constexpr const size_t record_number = 256;
-static constexpr const size_t record_length = 200;
-static constexpr const size_t record_size = record_number * record_length;
-static constexpr const size_t record_samplerate = 16000;
-static int16_t prev_y[record_length];
-static int16_t prev_h[record_length];
-static size_t rec_record_idx = 2;
-static size_t draw_record_idx = 0;
-static int16_t *rec_data;
+// グローバル変数（プログラム全体で使用する変数の定義をします。）
+constexpr int PIN_LED = 21; // 本体フルカラーLEDの使用端子（G21）
+constexpr int NUM_LEDS = 1; // 本体フルカラーLEDの数
 
-void setup(void) {
-  auto cfg = M5.config();
+constexpr int32_t VOLUME_THRESHOLD = 3000;
+gomadoufu::Recorder goma_recorder{};
 
-  // cfg.external_speaker.hat_spk = true;     /// use external speaker (HAT SPK)
-  // cfg.external_speaker.hat_spk2 = true;    /// use external speaker (HAT
-  // SPK2) cfg.external_speaker.atomic_spk = true;  /// use external speaker
-  // (ATOMIC SPK)
+CRGB led{};
 
-  M5.begin(cfg);
+BLEServer *pServer = NULL;
+BLECharacteristic *pCharacteristic = NULL;
 
-  M5.Display.startWrite();
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
 
-  if (M5.Display.width() > M5.Display.height()) {
-    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
-  }
+// See the following for generating UUIDs:
+// https://www.uuidgenerator.net/
 
-  M5.Display.setCursor(0, 0);
-  M5.Display.print("REC");
-  rec_data = (typeof(rec_data))heap_caps_malloc(record_size * sizeof(int16_t),
-                                                MALLOC_CAP_8BIT);
-  memset(rec_data, 0, record_size * sizeof(int16_t));
-  M5.Speaker.setVolume(255);
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-  /// Since the microphone and speaker cannot be used at the same time, turn off
-  /// the speaker here.
-  M5.Speaker.end();
-  M5.Mic.begin();
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) { deviceConnected = true; };
+
+  void onDisconnect(BLEServer *pServer) { deviceConnected = false; }
+};
+
+void setup_log() {
+  M5.Log.setLogLevel(m5::log_target_serial, ESP_LOG_DEBUG);
+  M5.Log.setEnableColor(m5::log_target_serial, true);
 }
 
-void loop(void) {
+void setup_ble() {
+  // Create the BLE Device
+  BLEDevice::init("kitahatsu-open-campus");
+
+  // Create the BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // Create a BLE Characteristic
+  pCharacteristic = pService->createCharacteristic(
+      CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ |
+                               BLECharacteristic::PROPERTY_WRITE |
+                               BLECharacteristic::PROPERTY_NOTIFY |
+                               BLECharacteristic::PROPERTY_INDICATE);
+
+  // Creates BLE Descriptor 0x2902: Client Characteristic Configuration
+  // Descriptor (CCCD)
+  pCharacteristic->addDescriptor(new BLE2902());
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinPreferred(
+      0x0); // set value to 0x00 to not advertise this parameter
+  BLEDevice::startAdvertising();
+}
+
+void setup_fast_led() {
+  FastLED.addLeds<WS2812B, PIN_LED, GRB>(&led, NUM_LEDS);
+  led =
+      CRGB(40, 40, 40); // 白色（赤, 緑, 青）※3色それぞれの明るさを0〜255で指定
+}
+
+void setup() {
+  auto cfg = M5.config(); // M5Stack初期設定用の構造体を代入
+  M5.begin(cfg);          // M5デバイスの初期化
+  setup_fast_led();
+  setup_log();
+
+  setup_ble();
+  M5_LOGD("Waiting a client connection to notify...");
+
+  // LEDを赤にしておく
+  led = CRGB::Red;
+  FastLED.show();
+
+  goma_recorder.setup();
+
+  // マイクの初期化
+  M5.Mic.begin();
+  M5_LOGD("begin mic");
+}
+
+void loop() {
   M5.update();
 
-  if (M5.Mic.isEnabled()) {
-    static constexpr int shift = 6;
-    auto data = &rec_data[rec_record_idx * record_length];
-    if (M5.Mic.record(data, record_length, record_samplerate)) {
-      data = &rec_data[draw_record_idx * record_length];
+  goma_recorder.record();
+  auto maxValue = goma_recorder.get_peak();
+  M5_LOGD("Recorded: peak = %d", maxValue);
 
-      int32_t w = M5.Display.width();
-      if (w > record_length - 1) {
-        w = record_length - 1;
-      }
-      for (int32_t x = 0; x < w; ++x) {
-        M5.Display.writeFastVLine(x, prev_y[x], prev_h[x], TFT_BLACK);
-        int32_t y1 = (data[x] >> shift);
-        int32_t y2 = (data[x + 1] >> shift);
-        if (y1 > y2) {
-          int32_t tmp = y1;
-          y1 = y2;
-          y2 = tmp;
-        }
-        int32_t y = (M5.Display.height() >> 1) + y1;
-        int32_t h = (M5.Display.height() >> 1) + y2 + 1 - y;
-        prev_y[x] = y;
-        prev_h[x] = h;
-        M5.Display.writeFastVLine(x, y, h, TFT_WHITE);
-      }
-      M5.Display.display();
-
-      if (++draw_record_idx >= record_number) {
-        draw_record_idx = 0;
-      }
-      if (++rec_record_idx >= record_number) {
-        rec_record_idx = 0;
-      }
+  // notify changed value
+  if (deviceConnected) {
+    if (maxValue > VOLUME_THRESHOLD) {
+      led = CRGB::Green;
+      pCharacteristic->setValue((uint8_t *)&maxValue, 2);
+      pCharacteristic->notify();
+    } else {
+      led = CRGB::Red;
     }
   }
-
-  if (M5.BtnA.wasHold() || M5.BtnB.wasClicked()) {
-    auto cfg = M5.Mic.config();
-    cfg.noise_filter_level = (cfg.noise_filter_level + 8) & 255;
-    M5.Mic.config(cfg);
-    M5.Display.setCursor(32, 0);
-    M5.Display.printf("nf:%03d", cfg.noise_filter_level);
-  } else if (M5.BtnA.wasClicked() ||
-             (M5.Touch.getCount() && M5.Touch.getDetail(0).wasClicked())) {
-    if (M5.Speaker.isEnabled()) {
-      M5.Display.clear();
-      while (M5.Mic.isRecording()) {
-        M5.delay(1);
-      }
-
-      /// Since the microphone and speaker cannot be used at the same time, turn
-      /// off the microphone here.
-      M5.Mic.end();
-      M5.Speaker.begin();
-
-      M5.Display.setCursor(0, 0);
-      M5.Display.print("PLAY");
-      int start_pos = rec_record_idx * record_length;
-      if (start_pos < record_size) {
-        M5.Speaker.playRaw(&rec_data[start_pos], record_size - start_pos,
-                           record_samplerate, false, 1, 0);
-      }
-      if (start_pos > 0) {
-        M5.Speaker.playRaw(rec_data, start_pos, record_samplerate, false, 1, 0);
-      }
-      do {
-        M5.delay(1);
-        M5.update();
-      } while (M5.Speaker.isPlaying());
-
-      /// Since the microphone and speaker cannot be used at the same time, turn
-      /// off the speaker here.
-      M5.Speaker.end();
-      M5.Mic.begin();
-
-      M5.Display.clear();
-      M5.Display.setCursor(0, 0);
-      M5.Display.print("REC");
-    }
+  // disconnecting
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); // give the bluetooth stack the chance to get things ready
+    led = CRGB(40, 40, 40);
+    pServer->startAdvertising(); // restart advertising
+    M5_LOGD("start advertising");
+    oldDeviceConnected = deviceConnected;
   }
-}
-
-#if !defined(ARDUINO)
-extern "C" {
-void loopTask(void *) {
-  setup();
-  for (;;) {
-    loop();
+  // connecting
+  if (deviceConnected && !oldDeviceConnected) {
+    // do stuff here on connecting
+    oldDeviceConnected = deviceConnected;
+    led = CRGB::Blue;
   }
-  vTaskDelete(NULL);
+  FastLED.show();
 }
-
-void app_main() {
-  xTaskCreatePinnedToCore(loopTask, "loopTask", 8192, NULL, 1, NULL, 1);
-}
-}
-#endif
