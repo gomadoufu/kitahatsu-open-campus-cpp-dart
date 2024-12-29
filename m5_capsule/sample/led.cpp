@@ -5,7 +5,7 @@
 constexpr int PIN_LED = 21; // 本体フルカラーLEDの使用端子（G21）
 constexpr int NUM_LEDS = 1; // 本体フルカラーLEDの数
 
-CRGB led;
+CRGB led{};
 
 void setup() {
   auto cfg = M5.config(); // M5Stack初期設定用の構造体を代入
