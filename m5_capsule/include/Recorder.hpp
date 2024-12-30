@@ -2,7 +2,7 @@
 
 #include <M5Unified.h>
 
-namespace gomadoufu {
+namespace goma {
 
 class Recorder {
   const size_t record_number = 256;
@@ -23,6 +23,10 @@ public:
     } else {
       memset(rec_data, 0, record_size * sizeof(int16_t));
     }
+
+    // マイクの初期化
+    M5.Mic.begin();
+    M5_LOGD("begin mic");
   }
 
   auto record() -> bool {
@@ -59,4 +63,4 @@ public:
   }
 };
 
-} // namespace gomadoufu
+} // namespace goma
